@@ -1396,6 +1396,8 @@ async def check_command(event):
 # ==========================================
 # NEW COMMAND: /mchk  — mass check from a replied .txt file
 # Uses the SAME new API #2 as /chk single-check (no sites needed).
+# Uses the SAME proxy-retry pattern as the old API — on failure (incl. 429),
+# retries up to 3 times with a fresh random proxy from proxy.txt.
 # /chk itself is not modified.
 # ==========================================
 @client.on(events.NewMessage(pattern='/mchk'))
@@ -1484,7 +1486,10 @@ async def mass_check_command(event):
                 if not current_proxies:
                     break
 
-                res = await check_card_new_api_with_retry(card, current_proxies, max_retries=1)
+                # MODIFIED: max_retries=1 → 3 — same retry-with-fresh-proxy pattern
+                # used by the old API (check_card_with_retry) to handle transient
+                # failures such as "Too Many Requests" (429).
+                res = await check_card_new_api_with_retry(card, current_proxies, max_retries=3)
 
                 all_results['checked'] += 1
                 all_results['last_card'] = card
