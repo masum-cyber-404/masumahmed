@@ -1393,6 +1393,156 @@ async def check_command(event):
 
         await send_final_results(user_id, all_results)
 
+# ==========================================
+# NEW COMMAND: /mchk  — mass check from a replied .txt file
+# Uses the exact same flow / helpers as the /chk mass-check branch.
+# /chk itself is not modified.
+# ==========================================
+@client.on(events.NewMessage(pattern='/mchk'))
+async def mass_check_command(event):
+    user_id = event.sender_id
+    if not await _require_reg(event):
+        return
+    try:
+        sender = await event.get_sender()
+        username = sender.username if sender.username else f"user_{user_id}"
+    except:
+        username = f"user_{user_id}"
+
+    if not is_premium(user_id):
+        await event.reply(premium_emoji("❌ Access Denied\n\nOnly premium users can use this bot."), parse_mode='html')
+        return
+
+    if not event.reply_to_msg_id:
+        await event.reply(premium_emoji("❌ Please reply to a .txt file containing cards."), parse_mode='html')
+        return
+
+    reply_msg = await event.get_reply_message()
+    if not reply_msg.file or not reply_msg.file.name.endswith('.txt'):
+        await event.reply(premium_emoji("❌ Please reply to a .txt file."), parse_mode='html')
+        return
+
+    if not load_sites():
+        await event.reply(premium_emoji("❌ No sites available. Please contact admin."), parse_mode='html')
+        return
+    if not load_proxies():
+        await event.reply(premium_emoji("❌ No proxies available. Please add proxies."), parse_mode='html')
+        return
+
+    status_msg = await event.reply(premium_emoji("🔄 Processing your file..."), parse_mode='html')
+    file_path = await reply_msg.download_media()
+
+    async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = await f.read()
+
+    cards = extract_cc(content)
+
+    if not cards:
+        await status_msg.edit(premium_emoji("❌ No valid cards found in file."), parse_mode='html')
+        os.remove(file_path)
+        return
+
+    if len(cards) > 5000:
+        await status_msg.edit(premium_emoji(f"⚠️ File contains {len(cards)} cards. Limiting to first 5000."), parse_mode='html')
+        cards = cards[:5000]
+
+    os.remove(file_path)
+
+    total_cards = len(cards)
+    await status_msg.edit(premium_emoji(f"🔥 Starting check for {total_cards} cards..."), parse_mode='html')
+
+    session_key = f"{user_id}_{status_msg.id}"
+    active_sessions[session_key] = {'paused': False}
+
+    all_results = {
+        'charged': [], 'approved': [], 'dead': [],
+        'total': total_cards, 'checked': 0, 'start_time': time.time(),
+        'last_card': '', 'last_response': '', 'last_price': '-', 'last_gateway': 'Unknown'
+    }
+
+    try:
+        queue = asyncio.Queue()
+        for card in cards:
+            queue.put_nowait(card)
+
+        last_update_time = [time.time()]
+
+        async def worker():
+            while not queue.empty() and session_key in active_sessions:
+                session_state = active_sessions.get(session_key)
+                if not session_state:
+                    break
+                while session_state.get('paused', False):
+                    await asyncio.sleep(1)
+                    session_state = active_sessions.get(session_key)
+                    if not session_state:
+                        return
+
+                try:
+                    card = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                current_sites = load_sites()
+                current_proxies = load_proxies()
+                if not current_sites or not current_proxies:
+                    break
+
+                res = await check_card_with_retry(card, current_sites, current_proxies, max_retries=1)
+
+                all_results['checked'] += 1
+                all_results['last_card'] = card
+                all_results['last_response'] = res.get('message', '')[:50]
+                all_results['last_price'] = res.get('price', '-')
+                all_results['last_gateway'] = res.get('gateway', 'Unknown')
+
+                if res['status'] == 'Charged':
+                    all_results['charged'].append(res)
+                    await send_realtime_hit(user_id, res, 'Charged', username)
+                elif res['status'] == 'Approved':
+                    all_results['approved'].append(res)
+                    await send_realtime_hit(user_id, res, 'Approved', username)
+                else:
+                    all_results['dead'].append(res)
+
+                queue.task_done()
+
+                now = time.time()
+                if now - last_update_time[0] >= 1.0:
+                    last_update_time[0] = now
+                    if session_key in active_sessions:
+                        try:
+                            await update_progress(user_id, status_msg.id, all_results, all_results['checked'])
+                        except Exception:
+                            pass
+
+        workers = [asyncio.create_task(worker()) for _ in range(10)]
+
+        while workers:
+            if session_key not in active_sessions:
+                for w in workers:
+                    if not w.done():
+                        w.cancel()
+                break
+            done, pending = await asyncio.wait(workers, timeout=1.0)
+            workers = list(pending)
+
+        if session_key in active_sessions:
+            await update_progress(user_id, status_msg.id, all_results, all_results['checked'])
+
+    except Exception as e:
+        await client.send_message(user_id, premium_emoji(f"❌ An error occurred: {e}"), parse_mode='html')
+    finally:
+        if session_key in active_sessions:
+            del active_sessions[session_key]
+
+        try:
+            await status_msg.delete()
+        except:
+            pass
+
+        await send_final_results(user_id, all_results)
+
 @client.on(events.NewMessage(pattern='/addproxy'))
 async def add_proxy_command(event):
     user_id = event.sender_id
