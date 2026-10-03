@@ -1395,7 +1395,7 @@ async def check_command(event):
 
 # ==========================================
 # NEW COMMAND: /mchk  — mass check from a replied .txt file
-# Uses the exact same flow / helpers as the /chk mass-check branch.
+# Uses the SAME new API #2 as /chk single-check (no sites needed).
 # /chk itself is not modified.
 # ==========================================
 @client.on(events.NewMessage(pattern='/mchk'))
@@ -1422,9 +1422,6 @@ async def mass_check_command(event):
         await event.reply(premium_emoji("❌ Please reply to a .txt file."), parse_mode='html')
         return
 
-    if not load_sites():
-        await event.reply(premium_emoji("❌ No sites available. Please contact admin."), parse_mode='html')
-        return
     if not load_proxies():
         await event.reply(premium_emoji("❌ No proxies available. Please add proxies."), parse_mode='html')
         return
@@ -1483,12 +1480,11 @@ async def mass_check_command(event):
                 except asyncio.QueueEmpty:
                     break
 
-                current_sites = load_sites()
                 current_proxies = load_proxies()
-                if not current_sites or not current_proxies:
+                if not current_proxies:
                     break
 
-                res = await check_card_with_retry(card, current_sites, current_proxies, max_retries=1)
+                res = await check_card_new_api_with_retry(card, current_proxies, max_retries=1)
 
                 all_results['checked'] += 1
                 all_results['last_card'] = card
